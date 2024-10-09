@@ -1,0 +1,127 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include "esp_wifi.h"
+
+// Define button and joystick pins
+const int buttonPins[] = {16, 36, 18, 37, 39, 17, 35, 15, 10, 9};
+const int upPin = 6, downPin = 41, leftPin = 5, rightPin = 4;
+
+// Structure to hold the button and joystick state data
+typedef struct struct_message {
+  uint32_t buttonStates;   // 32-bit value to hold all button states
+  int8_t joystickX;        // Joystick X-axis value (-127 to 127)
+  int8_t joystickY;        // Joystick Y-axis value (-127 to 127)
+} struct_message;
+
+// Create a struct_message to hold data
+struct_message myData;
+
+// Previous states for comparison
+volatile uint32_t prevButtonStates = 0;
+volatile int8_t prevJoystickX = 0, prevJoystickY = 0;
+
+// Receiver MAC address (replace with your receiver's MAC address)
+uint8_t receiverAddress[] = {0x24, 0xEC, 0x4A, 0x7E, 0xAC, 0x54};  // Update with your receiver's MAC address
+
+// Flag to indicate if a change has been detected
+volatile bool dataChanged = false;
+
+// Timer variables
+unsigned long lastSentTime = 0;
+const unsigned long sendInterval = 10;  // Send every 20 ms to reduce latency
+
+void IRAM_ATTR handleInputChange() {
+  // Read button states
+  uint32_t buttonStates = 0;
+  for (int i = 0; i < 10; i++) {
+    if (digitalRead(buttonPins[i]) == LOW) {
+      buttonStates |= (1 << i);  // Set corresponding bit for pressed buttons
+    }
+  }
+
+  // Read joystick digital inputs and map to joystick positions (-127 to 127)
+  int8_t xPos = 0, yPos = 0;
+  if (digitalRead(leftPin) == LOW) xPos = -127;
+  else if (digitalRead(rightPin) == LOW) xPos = 127;
+
+  if (digitalRead(upPin) == LOW) yPos = -127;
+  else if (digitalRead(downPin) == LOW) yPos = 127;
+
+  // Check if any input has changed
+  if (buttonStates != prevButtonStates || xPos != prevJoystickX || yPos != prevJoystickY) {
+    // Update previous states
+    prevButtonStates = buttonStates;
+    prevJoystickX = xPos;
+    prevJoystickY = yPos;
+
+    // Update struct data
+    myData.buttonStates = buttonStates;
+    myData.joystickX = xPos;
+    myData.joystickY = yPos;
+
+    // Set flag to indicate data has changed
+    dataChanged = true;
+  }
+}
+
+void setup() {
+  // Initialize Serial Monitor
+  Serial.begin(115200);
+
+  // Set device as a Wi-Fi Station
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();  // Prevent auto-reconnect
+
+  // Set maximum Wi-Fi transmission power for lowest latency
+  esp_wifi_set_max_tx_power(78);  // Set power level to 78 (20dBm)
+
+  // Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+  Serial.println("ESP-NOW initialized successfully");
+
+  // Register the receiver peer
+  esp_now_peer_info_t peerInfo;
+  memcpy(peerInfo.peer_addr, receiverAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  // Add peer
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
+    return;
+  }
+
+  // Initialize buttons and joystick pins as inputs with pullup resistors
+  for (int i = 0; i < 10; i++) {
+    pinMode(buttonPins[i], INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(buttonPins[i]), handleInputChange, CHANGE);
+  }
+
+  pinMode(upPin, INPUT_PULLUP);
+  pinMode(downPin, INPUT_PULLUP);
+  pinMode(leftPin, INPUT_PULLUP);
+  pinMode(rightPin, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(upPin), handleInputChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(downPin), handleInputChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(leftPin), handleInputChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(rightPin), handleInputChange, CHANGE);
+}
+
+void loop() {
+  // Send data if a change is detected or at regular intervals to reduce latency
+  if (dataChanged || (millis() - lastSentTime >= sendInterval)) {
+    // Send the struct data via ESP-NOW
+    esp_now_send(receiverAddress, (uint8_t *)&myData, sizeof(myData));
+    Serial.println("Data sent due to state change");
+
+    // Reset data changed flag
+    dataChanged = false;
+
+    // Update last sent time
+    lastSentTime = millis();
+  }
+}
