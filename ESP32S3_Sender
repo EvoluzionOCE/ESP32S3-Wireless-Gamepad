@@ -28,7 +28,7 @@ volatile bool dataChanged = false;
 
 // Timer variables
 unsigned long lastSentTime = 0;
-const unsigned long sendInterval = 10;  // Send every 20 ms to reduce latency
+const unsigned long sendInterval = 10;  // Send every 10 ms to reduce latency
 
 void IRAM_ATTR handleInputChange() {
   // Read button states
