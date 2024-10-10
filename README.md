@@ -2,7 +2,7 @@
 
 This project will provide you with 2 codes. An ESP32S3 sender code and an ESP32S3 Receiver Code.
 
-These are based off the Arduino ESP32-S3-Pico boards, latency is ultra low due to ESPNOW.
+These are using the Waveshare ESP32-S3-Pico boards, latency is ultra low due to ESPNOW.
 
 Change the MAC address of in the sender code to the ESP32S3 receiver MAC to ensure communication. 
 
