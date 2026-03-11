@@ -3,59 +3,105 @@
 #include <esp_now.h>
 #include <WiFi.h>
 #include "esp_wifi.h"
+#include <stddef.h>
 
-// Create a USB HID gamepad object
-USBHIDGamepad Gamepad;
+// ── Packet structure (must match sender exactly) ──────────────────────────────
 
-// Structure to hold incoming data
 typedef struct struct_message {
-  uint32_t buttonStates;
-  int8_t joystickX;
-  int8_t joystickY;
+  uint32_t buttonStates;  // Bitmask: bit N = button N pressed
+  int8_t   joystickX;     // -127 (left) … 127 (right)
+  int8_t   joystickY;     // -127 (up)   … 127 (down)
+  uint8_t  crc;           // CRC-8 over the preceding 6 bytes
 } struct_message;
 
-// Create a struct_message to hold incoming data
-struct_message incomingData;
+// ── CRC-8 (poly 0x07) – must be identical to sender ──────────────────────────
 
-// Callback function for receiving data with the correct signature
-void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
-  // Copy the incoming data into the struct
-  memcpy(&incomingData, data, sizeof(incomingData));
-
-  // Update the gamepad state with the received values
-  int8_t z = 0, rz = 0, rx = 0, ry = 0;  // Other axes not used
-  uint8_t hat = 0;  // Hat switch not used
-
-  // Use the send function with the correct parameters
-  Gamepad.send(incomingData.joystickX, incomingData.joystickY, z, rz, rx, ry, hat, incomingData.buttonStates);
+static uint8_t crc8(const uint8_t *data, size_t len) {
+  uint8_t crc = 0;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int j = 0; j < 8; j++)
+      crc = (crc & 0x80) ? ((crc << 1) ^ 0x07) : (crc << 1);
+  }
+  return crc;
 }
 
+// ── USB HID Gamepad ───────────────────────────────────────────────────────────
+
+USBHIDGamepad Gamepad;
+
+// ── Watchdog ──────────────────────────────────────────────────────────────────
+
+// If no valid packet is received for this long, reset gamepad to safe state
+#define WATCHDOG_MS 200
+
+volatile unsigned long lastPacketMs = 0;
+static bool safeModeActive = false;
+
+// ── ESP-NOW receive callback ──────────────────────────────────────────────────
+
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  // Guard: reject NULL data or undersized packets
+  if (data == nullptr || (size_t)len < sizeof(struct_message)) {
+    Serial.printf("[ESP-NOW] Bad packet: data=%p len=%d (expected %u)\n",
+                  data, len, (unsigned)sizeof(struct_message));
+    return;
+  }
+
+  struct_message pkt;
+  memcpy(&pkt, data, sizeof(pkt));
+
+  // Verify CRC – drop corrupted packets silently to avoid glitches
+  uint8_t expected = crc8((const uint8_t *)&pkt, offsetof(struct_message, crc));
+  if (pkt.crc != expected) {
+    Serial.printf("[ESP-NOW] CRC mismatch: got 0x%02X expected 0x%02X – dropped\n",
+                  pkt.crc, expected);
+    return;
+  }
+
+  // Packet is valid – update gamepad and refresh watchdog
+  lastPacketMs   = millis();
+  safeModeActive = false;
+
+  Gamepad.send(pkt.joystickX, pkt.joystickY,
+               0, 0, 0, 0,       // Z, Rz, Rx, Ry (unused)
+               0,                 // Hat switch (unused)
+               pkt.buttonStates);
+}
+
+// ── setup ─────────────────────────────────────────────────────────────────────
+
 void setup() {
-  // Initialize Serial Monitor
   Serial.begin(115200);
 
-  // Initialize USB HID functionality
+  // USB HID must be started before WiFi/ESP-NOW
   USB.begin();
   Gamepad.begin();
 
-  // Set device as a Wi-Fi Station
   WiFi.mode(WIFI_STA);
+  esp_wifi_set_max_tx_power(78);  // 20 dBm for maximum range
 
-  // Set maximum Wi-Fi transmission power for lowest latency
-  esp_wifi_set_max_tx_power(78);
-
-  // Initialize ESP-NOW
   if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
-    return;
+    Serial.println("[ESP-NOW] Init failed – halting");
+    while (true) delay(1000);
   }
-  Serial.println("ESP-NOW initialized successfully");
 
-  // Register for receive callback
   esp_now_register_recv_cb(onDataRecv);
+
+  // Seed watchdog so we don't immediately fire safe-mode on boot
+  lastPacketMs = millis();
+
+  Serial.println("[ESP-NOW] Receiver ready");
 }
 
+// ── loop ──────────────────────────────────────────────────────────────────────
+
 void loop() {
-  // Nothing to do here, wait for incoming data and update gamepad state
-  // No delay here to avoid introducing latency in handling incoming data
+  // Watchdog: if the sender drops out, release all inputs so the host
+  // doesn't see a permanently held button or stuck axis.
+  if (!safeModeActive && (millis() - lastPacketMs > WATCHDOG_MS)) {
+    Gamepad.send(0, 0, 0, 0, 0, 0, 0, 0);
+    safeModeActive = true;
+    Serial.println("[Watchdog] Sender lost – gamepad reset to safe state");
+  }
 }

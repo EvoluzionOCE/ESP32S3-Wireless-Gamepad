@@ -1,127 +1,198 @@
 #include <esp_now.h>
 #include <WiFi.h>
 #include "esp_wifi.h"
+#include <stddef.h>
 
-// Define button and joystick pins
-const int buttonPins[] = {16, 36, 18, 37, 39, 17, 35, 15, 10, 9};
-const int upPin = 6, downPin = 41, leftPin = 5, rightPin = 4;
+// ── Configuration ────────────────────────────────────────────────────────────
 
-// Structure to hold the button and joystick state data
+// Receiver MAC address – update this to match your receiver board
+uint8_t receiverAddress[] = {0x24, 0xEC, 0x4A, 0x7E, 0xAC, 0x54};
+
+#define NUM_BUTTONS      10
+#define DEBOUNCE_US      5000   // 5 ms button debounce window
+#define SEND_INTERVAL_MS 10     // Periodic send rate (100 Hz)
+
+// Button GPIO pins
+const uint8_t BUTTON_PINS[NUM_BUTTONS] = {16, 36, 18, 37, 39, 17, 35, 15, 10, 9};
+
+// D-Pad GPIO pins
+const uint8_t UP_PIN    = 6;
+const uint8_t DOWN_PIN  = 41;
+const uint8_t LEFT_PIN  = 5;
+const uint8_t RIGHT_PIN = 4;
+
+// ── Packet structure (must match receiver exactly) ────────────────────────────
+
 typedef struct struct_message {
-  uint32_t buttonStates;   // 32-bit value to hold all button states
-  int8_t joystickX;        // Joystick X-axis value (-127 to 127)
-  int8_t joystickY;        // Joystick Y-axis value (-127 to 127)
+  uint32_t buttonStates;  // Bitmask: bit N = button N pressed
+  int8_t   joystickX;     // -127 (left) … 127 (right)
+  int8_t   joystickY;     // -127 (up)   … 127 (down)
+  uint8_t  crc;           // CRC-8 over the preceding 6 bytes
 } struct_message;
 
-// Create a struct_message to hold data
-struct_message myData;
+// ── CRC-8 (poly 0x07) – must be identical in sender and receiver ─────────────
 
-// Previous states for comparison
-volatile uint32_t prevButtonStates = 0;
-volatile int8_t prevJoystickX = 0, prevJoystickY = 0;
+static uint8_t crc8(const uint8_t *data, size_t len) {
+  uint8_t crc = 0;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int j = 0; j < 8; j++)
+      crc = (crc & 0x80) ? ((crc << 1) ^ 0x07) : (crc << 1);
+  }
+  return crc;
+}
 
-// Receiver MAC address (replace with your receiver's MAC address)
-uint8_t receiverAddress[] = {0x24, 0xEC, 0x4A, 0x7E, 0xAC, 0x54};  // Update with your receiver's MAC address
+// ── Shared state (ISR ↔ loop) ─────────────────────────────────────────────────
 
-// Flag to indicate if a change has been detected
+static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+static struct_message myData;
 volatile bool dataChanged = false;
 
-// Timer variables
-unsigned long lastSentTime = 0;
-const unsigned long sendInterval = 10;  // Send every 10 ms to reduce latency
+// Previous states used inside the ISR only
+static uint32_t prevButtonStates = 0xFFFFFFFF;  // Force first-send on boot
+static int8_t   prevJoystickX    = 0;
+static int8_t   prevJoystickY    = 0;
+
+// Debounce: last ISR fire time in microseconds
+static volatile int64_t lastDebounceUs = 0;
+
+// ── ISR ───────────────────────────────────────────────────────────────────────
 
 void IRAM_ATTR handleInputChange() {
-  // Read button states
+  // Reject bounces within the debounce window
+  int64_t now = esp_timer_get_time();
+  if ((now - lastDebounceUs) < DEBOUNCE_US) return;
+  lastDebounceUs = now;
+
+  // Sample buttons
   uint32_t buttonStates = 0;
-  for (int i = 0; i < 10; i++) {
-    if (digitalRead(buttonPins[i]) == LOW) {
-      buttonStates |= (1 << i);  // Set corresponding bit for pressed buttons
-    }
+  for (int i = 0; i < NUM_BUTTONS; i++) {
+    if (digitalRead(BUTTON_PINS[i]) == LOW)
+      buttonStates |= (1u << i);
   }
 
-  // Read joystick digital inputs and map to joystick positions (-127 to 127)
+  // Sample D-Pad
   int8_t xPos = 0, yPos = 0;
-  if (digitalRead(leftPin) == LOW) xPos = -127;
-  else if (digitalRead(rightPin) == LOW) xPos = 127;
+  if      (digitalRead(LEFT_PIN)  == LOW) xPos = -127;
+  else if (digitalRead(RIGHT_PIN) == LOW) xPos =  127;
+  if      (digitalRead(UP_PIN)    == LOW) yPos = -127;
+  else if (digitalRead(DOWN_PIN)  == LOW) yPos =  127;
 
-  if (digitalRead(upPin) == LOW) yPos = -127;
-  else if (digitalRead(downPin) == LOW) yPos = 127;
-
-  // Check if any input has changed
   if (buttonStates != prevButtonStates || xPos != prevJoystickX || yPos != prevJoystickY) {
-    // Update previous states
     prevButtonStates = buttonStates;
-    prevJoystickX = xPos;
-    prevJoystickY = yPos;
+    prevJoystickX    = xPos;
+    prevJoystickY    = yPos;
 
-    // Update struct data
+    // Atomically update the shared packet
+    portENTER_CRITICAL_ISR(&mux);
     myData.buttonStates = buttonStates;
-    myData.joystickX = xPos;
-    myData.joystickY = yPos;
-
-    // Set flag to indicate data has changed
-    dataChanged = true;
+    myData.joystickX    = xPos;
+    myData.joystickY    = yPos;
+    myData.crc          = crc8((const uint8_t *)&myData, offsetof(struct_message, crc));
+    dataChanged         = true;
+    portEXIT_CRITICAL_ISR(&mux);
   }
 }
 
+// ── ESP-NOW send callback ─────────────────────────────────────────────────────
+
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  if (status != ESP_NOW_SEND_SUCCESS)
+    Serial.println("[ESP-NOW] Send failed");
+}
+
+// ── Read real pin state and initialise myData / prevState ────────────────────
+
+static void readInitialState() {
+  uint32_t buttonStates = 0;
+  for (int i = 0; i < NUM_BUTTONS; i++) {
+    if (digitalRead(BUTTON_PINS[i]) == LOW)
+      buttonStates |= (1u << i);
+  }
+
+  int8_t xPos = 0, yPos = 0;
+  if      (digitalRead(LEFT_PIN)  == LOW) xPos = -127;
+  else if (digitalRead(RIGHT_PIN) == LOW) xPos =  127;
+  if      (digitalRead(UP_PIN)    == LOW) yPos = -127;
+  else if (digitalRead(DOWN_PIN)  == LOW) yPos =  127;
+
+  prevButtonStates    = buttonStates;
+  prevJoystickX       = xPos;
+  prevJoystickY       = yPos;
+  myData.buttonStates = buttonStates;
+  myData.joystickX    = xPos;
+  myData.joystickY    = yPos;
+  myData.crc          = crc8((const uint8_t *)&myData, offsetof(struct_message, crc));
+}
+
+// ── setup ─────────────────────────────────────────────────────────────────────
+
 void setup() {
-  // Initialize Serial Monitor
   Serial.begin(115200);
 
-  // Set device as a Wi-Fi Station
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect();  // Prevent auto-reconnect
+  WiFi.disconnect();  // Do not join any network; ESP-NOW works standalone
+  esp_wifi_set_max_tx_power(78);  // 20 dBm for maximum range
 
-  // Set maximum Wi-Fi transmission power for lowest latency
-  esp_wifi_set_max_tx_power(78);  // Set power level to 78 (20dBm)
-
-  // Initialize ESP-NOW
   if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
-    return;
+    Serial.println("[ESP-NOW] Init failed – halting");
+    while (true) delay(1000);
   }
-  Serial.println("ESP-NOW initialized successfully");
 
-  // Register the receiver peer
+  esp_now_register_send_cb(onDataSent);
+
   esp_now_peer_info_t peerInfo;
+  memset(&peerInfo, 0, sizeof(peerInfo));  // Zero-init to avoid garbage in reserved fields
   memcpy(peerInfo.peer_addr, receiverAddress, 6);
   peerInfo.channel = 0;
   peerInfo.encrypt = false;
 
-  // Add peer
   if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("Failed to add peer");
-    return;
+    Serial.println("[ESP-NOW] Failed to register peer – halting");
+    while (true) delay(1000);
   }
 
-  // Initialize buttons and joystick pins as inputs with pullup resistors
-  for (int i = 0; i < 10; i++) {
-    pinMode(buttonPins[i], INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(buttonPins[i]), handleInputChange, CHANGE);
+  // Configure input pins
+  for (int i = 0; i < NUM_BUTTONS; i++) {
+    pinMode(BUTTON_PINS[i], INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(BUTTON_PINS[i]), handleInputChange, CHANGE);
   }
+  pinMode(UP_PIN,    INPUT_PULLUP);
+  pinMode(DOWN_PIN,  INPUT_PULLUP);
+  pinMode(LEFT_PIN,  INPUT_PULLUP);
+  pinMode(RIGHT_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(UP_PIN),    handleInputChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(DOWN_PIN),  handleInputChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(LEFT_PIN),  handleInputChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(RIGHT_PIN), handleInputChange, CHANGE);
 
-  pinMode(upPin, INPUT_PULLUP);
-  pinMode(downPin, INPUT_PULLUP);
-  pinMode(leftPin, INPUT_PULLUP);
-  pinMode(rightPin, INPUT_PULLUP);
+  // Seed state from actual pin values so the first packet is accurate
+  readInitialState();
 
-  attachInterrupt(digitalPinToInterrupt(upPin), handleInputChange, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(downPin), handleInputChange, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(leftPin), handleInputChange, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(rightPin), handleInputChange, CHANGE);
+  Serial.println("[ESP-NOW] Sender ready");
 }
 
+// ── loop ──────────────────────────────────────────────────────────────────────
+
+static unsigned long lastSentTime = 0;
+
 void loop() {
-  // Send data if a change is detected or at regular intervals to reduce latency
-  if (dataChanged || (millis() - lastSentTime >= sendInterval)) {
-    // Send the struct data via ESP-NOW
-    esp_now_send(receiverAddress, (uint8_t *)&myData, sizeof(myData));
-    Serial.println("Data sent due to state change");
+  bool shouldSend = false;
+  struct_message snapshot;
 
-    // Reset data changed flag
+  // Atomically check flag and snapshot the packet
+  portENTER_CRITICAL(&mux);
+  if (dataChanged || (millis() - lastSentTime >= SEND_INTERVAL_MS)) {
+    snapshot    = myData;
     dataChanged = false;
+    shouldSend  = true;
+  }
+  portEXIT_CRITICAL(&mux);
 
-    // Update last sent time
+  if (shouldSend) {
+    esp_err_t err = esp_now_send(receiverAddress, (uint8_t *)&snapshot, sizeof(snapshot));
+    if (err != ESP_OK)
+      Serial.printf("[ESP-NOW] Send error: %s\n", esp_err_to_name(err));
     lastSentTime = millis();
   }
 }
