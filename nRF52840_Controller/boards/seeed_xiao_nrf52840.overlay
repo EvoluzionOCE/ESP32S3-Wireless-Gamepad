@@ -1,0 +1,84 @@
+/*
+ * Device tree overlay — Seeed XIAO nRF52840 (Controller / Sender)
+ *
+ * Physical wiring (all buttons active-LOW, switch to GND):
+ *
+ *   XIAO pin │ nRF52840 port │ Function
+ *   ─────────┼───────────────┼──────────────────
+ *   D0       │ P0.02         │ D-Pad UP
+ *   D1       │ P0.03         │ D-Pad DOWN
+ *   D2       │ P0.28         │ D-Pad LEFT
+ *   D3       │ P0.29         │ D-Pad RIGHT
+ *   D4       │ P0.04         │ LP  (Light Punch)
+ *   D5       │ P0.05         │ MP  (Medium Punch)
+ *   D6       │ P1.11         │ HP  (Hard Punch)
+ *   D7       │ P1.12         │ LK  (Light Kick)
+ *   D8       │ P1.13         │ MK  (Medium Kick)
+ *   D9       │ P1.14         │ HK  (Hard Kick)
+ *   D10      │ P1.15         │ START
+ */
+
+/ {
+    aliases {
+        dpad-up    = &dpad_up_node;
+        dpad-down  = &dpad_down_node;
+        dpad-left  = &dpad_left_node;
+        dpad-right = &dpad_right_node;
+        btn-lp     = &btn_lp_node;
+        btn-mp     = &btn_mp_node;
+        btn-hp     = &btn_hp_node;
+        btn-lk     = &btn_lk_node;
+        btn-mk     = &btn_mk_node;
+        btn-hk     = &btn_hk_node;
+        btn-start  = &btn_start_node;
+    };
+
+    fightpad_inputs {
+        compatible = "gpio-keys";
+
+        dpad_up_node: dpad_up {
+            gpios = <&gpio0 2 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+            label = "DPAD_UP";
+        };
+        dpad_down_node: dpad_down {
+            gpios = <&gpio0 3 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+            label = "DPAD_DOWN";
+        };
+        dpad_left_node: dpad_left {
+            gpios = <&gpio0 28 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+            label = "DPAD_LEFT";
+        };
+        dpad_right_node: dpad_right {
+            gpios = <&gpio0 29 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+            label = "DPAD_RIGHT";
+        };
+        btn_lp_node: btn_lp {
+            gpios = <&gpio0 4 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+            label = "BTN_LP";
+        };
+        btn_mp_node: btn_mp {
+            gpios = <&gpio0 5 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+            label = "BTN_MP";
+        };
+        btn_hp_node: btn_hp {
+            gpios = <&gpio1 11 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+            label = "BTN_HP";
+        };
+        btn_lk_node: btn_lk {
+            gpios = <&gpio1 12 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+            label = "BTN_LK";
+        };
+        btn_mk_node: btn_mk {
+            gpios = <&gpio1 13 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+            label = "BTN_MK";
+        };
+        btn_hk_node: btn_hk {
+            gpios = <&gpio1 14 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+            label = "BTN_HK";
+        };
+        btn_start_node: btn_start {
+            gpios = <&gpio1 15 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+            label = "BTN_START";
+        };
+    };
+};

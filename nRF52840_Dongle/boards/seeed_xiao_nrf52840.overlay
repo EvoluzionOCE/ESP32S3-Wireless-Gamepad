@@ -1,0 +1,9 @@
+/*
+ * Device tree overlay — Seeed XIAO nRF52840 (Dongle / Receiver)
+ *
+ * No extra GPIO pins are needed — the dongle only uses USB and the
+ * nRF52840's internal 2.4 GHz radio (ESB).
+ *
+ * If using the Nordic PCA10059 dongle instead, rename this file to
+ * nrf52840dongle_nrf52840.overlay — no content changes required.
+ */
